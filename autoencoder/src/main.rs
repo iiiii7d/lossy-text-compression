@@ -134,7 +134,7 @@ impl<B: Backend> Batcher<String, Tensor<B, 2>> for DataBatcher<B> {
 pub struct TrainingConfig {
     pub model: ModelConfig,
     pub optimizer: AdamConfig,
-    #[config(default = 5)]
+    #[config(default = 10)]
     pub num_epochs: usize,
     #[config(default = 64)]
     pub batch_size: usize,
@@ -251,10 +251,10 @@ fn main() {
             .chunks(CHUNK_SIZE)
             .map(|a| String::from_utf8_lossy(a).to_string())
             .collect::<Vec<_>>();
-        infer::<MyBackend>("/tmp/guide", device, text)
+        infer::<MyBackend>("/tmp/autoencoder", device, text)
     } else {
         train::<MyAutodiffBackend>(
-            "/tmp/guide",
+            "/tmp/autoencoder",
             TrainingConfig::new(ModelConfig::new(), AdamConfig::new()),
             device,
         );
