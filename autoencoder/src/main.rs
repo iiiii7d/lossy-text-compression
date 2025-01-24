@@ -1,20 +1,24 @@
 use std::env::args;
 
-use burn::backend::wgpu::AutoGraphicsApi;
-use burn::backend::{Autodiff, Wgpu};
-use burn::config::Config;
-use burn::data::dataloader::batcher::Batcher;
-use burn::data::dataloader::DataLoaderBuilder;
-use burn::data::dataset::Dataset;
-use burn::module::Module;
-use burn::nn::loss::{MSELoss, Reduction};
-use burn::nn::{Dropout, DropoutConfig, Linear, LinearConfig, ReLU};
-use burn::optim::AdamConfig;
-use burn::record::{CompactRecorder, Recorder};
-use burn::tensor::backend::{AutodiffBackend, Backend};
-use burn::tensor::Tensor;
-use burn::train::metric::{CpuUse, LossMetric};
-use burn::train::{LearnerBuilder, RegressionOutput, TrainOutput, TrainStep, ValidStep};
+use burn::{
+    backend::{wgpu::WgpuDevice, Autodiff, Wgpu},
+    data::{
+        dataloader::{batcher::Batcher, DataLoaderBuilder},
+        dataset::Dataset,
+    },
+    nn::{
+        loss::{MseLoss, Reduction},
+        Dropout, DropoutConfig, Linear, LinearConfig, Relu,
+    },
+    optim::AdamConfig,
+    prelude::*,
+    record::{CompactRecorder, Recorder},
+    tensor::backend::AutodiffBackend,
+    train::{
+        metric::{CpuUse, LossMetric},
+        LearnerBuilder, RegressionOutput, TrainOutput, TrainStep, ValidStep,
+    },
+};
 
 const CHARS: &str = " !#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~\n";
 const CHUNK_SIZE: usize = 64;
@@ -24,7 +28,7 @@ pub struct Model<B: Backend> {
     linear2: Linear<B>,
     linear3: Linear<B>,
     linear4: Linear<B>,
-    activation: ReLU,
+    activation: Relu,
     dropout: Dropout,
 }
 
@@ -43,11 +47,12 @@ impl<B: Backend> Model<B> {
         let x = self.dropout.forward(x);
         let x = self.activation.forward(x);
 
+        #[allow(clippy::let_and_return)]
         x
     }
     pub fn forward_regression(&self, x: Tensor<B, 2>) -> RegressionOutput<B> {
         let output = self.forward(x.clone());
-        let loss = MSELoss::new().forward(output.clone(), x.clone(), Reduction::Auto);
+        let loss = MseLoss::new().forward(output.clone(), x.clone(), Reduction::Auto);
 
         RegressionOutput::new(loss, output, x)
     }
@@ -76,32 +81,19 @@ pub struct ModelConfig {
 }
 
 impl ModelConfig {
-    pub fn init<B: Backend>(&self) -> Model<B> {
+    pub fn init<B: Backend>(&self, device: B::Device) -> Model<B> {
         Model {
-            linear1: LinearConfig::new(self.num_classes, self.num_classes / 2).init(),
-            linear2: LinearConfig::new(self.num_classes / 2, self.num_classes / 4).init(),
-            linear3: LinearConfig::new(self.num_classes / 4, self.num_classes / 2).init(),
-            linear4: LinearConfig::new(self.num_classes / 2, self.num_classes).init(),
-            activation: ReLU::new(),
-            dropout: DropoutConfig::new(self.dropout).init(),
-        }
-    }
-    pub fn init_with<B: Backend>(&self, record: ModelRecord<B>) -> Model<B> {
-        Model {
-            linear1: LinearConfig::new(self.num_classes, self.num_classes / 2)
-                .init_with(record.linear1),
-            linear2: LinearConfig::new(self.num_classes / 2, self.num_classes / 4)
-                .init_with(record.linear2),
-            linear3: LinearConfig::new(self.num_classes / 4, self.num_classes / 2)
-                .init_with(record.linear3),
-            linear4: LinearConfig::new(self.num_classes / 2, self.num_classes)
-                .init_with(record.linear4),
-            activation: ReLU::new(),
+            linear1: LinearConfig::new(self.num_classes, self.num_classes / 2).init(&device),
+            linear2: LinearConfig::new(self.num_classes / 2, self.num_classes / 4).init(&device),
+            linear3: LinearConfig::new(self.num_classes / 4, self.num_classes / 2).init(&device),
+            linear4: LinearConfig::new(self.num_classes / 2, self.num_classes).init(&device),
+            activation: Relu::new(),
             dropout: DropoutConfig::new(self.dropout).init(),
         }
     }
 }
 
+#[derive(Clone)]
 pub struct DataBatcher<B: Backend> {
     device: B::Device,
 }
@@ -120,7 +112,7 @@ impl<B: Backend> Batcher<String, Tensor<B, 2>> for DataBatcher<B> {
                 let tensors = a
                     .chars()
                     .map(|a| CHARS.find(a).unwrap_or_default())
-                    .map(|c| Tensor::<B, 1>::one_hot(c, CHARS.len()))
+                    .map(|c| Tensor::<B, 1>::one_hot(c, CHARS.len(), &self.device))
                     .collect::<Vec<_>>();
                 Tensor::cat(tensors, 0).reshape([1, CHARS.len() * CHUNK_SIZE])
             })
@@ -185,20 +177,16 @@ pub fn train<B: AutodiffBackend>(artifact_dir: &str, config: TrainingConfig, dev
             string.split_at(string.len() / 5 * 4).1.to_string(),
         ));
 
-    let record = CompactRecorder::new()
-        .load::<CompactRecorder>(format!("{artifact_dir}/model").into())
-        .unwrap_or_else(|_| CompactRecorder::new());
-
     let learner = LearnerBuilder::new(artifact_dir)
-        .metric_train_numeric(CpuUse::new())
-        .metric_valid_numeric(CpuUse::new())
         .metric_train_numeric(LossMetric::new())
         .metric_valid_numeric(LossMetric::new())
-        .with_file_checkpointer(record)
-        .devices(vec![device])
+        .metric_train_numeric(CpuUse::new())
+        .metric_valid_numeric(CpuUse::new())
+        .with_file_checkpointer(CompactRecorder::new())
+        .devices(vec![device.clone()])
         .num_epochs(config.num_epochs)
         .build(
-            config.model.init::<B>(),
+            config.model.init::<B>(device),
             config.optimizer.init(),
             config.learning_rate,
         );
@@ -214,10 +202,10 @@ pub fn infer<B: Backend>(artifact_dir: &str, device: B::Device, items: Vec<Strin
     let config = TrainingConfig::load(format!("{artifact_dir}/config.json"))
         .expect("Config should exist for the model");
     let record = CompactRecorder::new()
-        .load(format!("{artifact_dir}/model").into())
+        .load(format!("{artifact_dir}/model").into(), &device)
         .expect("Trained model should exist");
 
-    let model = config.model.init_with::<B>(record).to_device(&device);
+    let model = config.model.init::<B>(device.clone()).load_record(record);
 
     let batcher = DataBatcher::new(device);
     let batch = batcher.batch(items.clone());
@@ -225,17 +213,10 @@ pub fn infer<B: Backend>(artifact_dir: &str, device: B::Device, items: Vec<Strin
         .forward(batch.clone())
         .reshape([items.len(), CHUNK_SIZE, CHARS.len()])
         .argmax(2)
-        .into_data()
-        .value;
+        .into_data();
     let output = output
-        .into_iter()
-        .map(|a| {
-            CHARS
-                .chars()
-                .nth(a.to_string().parse::<usize>().unwrap())
-                .unwrap()
-                .to_string()
-        })
+        .iter::<u16>()
+        .map(|a| CHARS.chars().nth(a as usize).unwrap().to_string())
         .collect::<Vec<_>>()
         .join("");
 
@@ -243,12 +224,12 @@ pub fn infer<B: Backend>(artifact_dir: &str, device: B::Device, items: Vec<Strin
 }
 
 fn main() {
-    type MyBackend = Wgpu<AutoGraphicsApi, f32, i32>;
+    type MyBackend = Wgpu<f32, i32>;
     type MyAutodiffBackend = Autodiff<MyBackend>;
 
-    let device = burn::backend::wgpu::WgpuDevice::default();
-    if args().nth(1).map_or(false, |a| a == "infer") {
-        let text = include_str!("../../shakespeare.txt")
+    let device = WgpuDevice::default();
+    if args().nth(1).is_some_and(|a| a == "infer") {
+        let text = include_str!("../../bee.txt")
             .split_at(8192)
             .0
             .as_bytes()
