@@ -134,13 +134,13 @@ impl<B: Backend> Batcher<String, Tensor<B, 2>> for DataBatcher<B> {
 pub struct TrainingConfig {
     pub model: ModelConfig,
     pub optimizer: AdamConfig,
-    #[config(default = 10)]
+    #[config(default = 40)]
     pub num_epochs: usize,
     #[config(default = 64)]
     pub batch_size: usize,
     #[config(default = 4)]
     pub num_workers: usize,
-    #[config(default = 0)]
+    #[config(default = 1)]
     pub seed: u64,
     #[config(default = 1.0e-4)]
     pub learning_rate: f64,
@@ -185,12 +185,16 @@ pub fn train<B: AutodiffBackend>(artifact_dir: &str, config: TrainingConfig, dev
             string.split_at(string.len() / 5 * 4).1.to_string(),
         ));
 
+    let record = CompactRecorder::new()
+        .load::<CompactRecorder>(format!("{artifact_dir}/model").into())
+        .unwrap_or_else(|_| CompactRecorder::new());
+
     let learner = LearnerBuilder::new(artifact_dir)
         .metric_train_numeric(CpuUse::new())
         .metric_valid_numeric(CpuUse::new())
         .metric_train_numeric(LossMetric::new())
         .metric_valid_numeric(LossMetric::new())
-        .with_file_checkpointer(CompactRecorder::new())
+        .with_file_checkpointer(record)
         .devices(vec![device])
         .num_epochs(config.num_epochs)
         .build(
