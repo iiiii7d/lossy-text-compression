@@ -177,19 +177,22 @@ pub fn train<B: AutodiffBackend>(artifact_dir: &str, config: TrainingConfig, dev
             string.split_at(string.len() / 5 * 4).1.to_string(),
         ));
 
-    let learner = LearnerBuilder::new(artifact_dir)
+    let mut lb = LearnerBuilder::new(artifact_dir)
         .metric_train_numeric(LossMetric::new())
         .metric_valid_numeric(LossMetric::new())
         .metric_train_numeric(CpuUse::new())
         .metric_valid_numeric(CpuUse::new())
         .with_file_checkpointer(CompactRecorder::new())
         .devices(vec![device.clone()])
-        .num_epochs(config.num_epochs)
-        .build(
-            config.model.init::<B>(device),
-            config.optimizer.init(),
-            config.learning_rate,
-        );
+        .num_epochs(config.num_epochs);
+    if let Some(c) = args().nth(1).and_then(|a| a.parse::<usize>().ok()) {
+        lb = lb.checkpoint(c)
+    }
+    let learner = lb.build(
+        config.model.init::<B>(device),
+        config.optimizer.init(),
+        config.learning_rate,
+    );
 
     let model_trained = learner.fit(dataloader_train, dataloader_valid);
 
