@@ -7,6 +7,7 @@ use burn::{
         dataset::Dataset,
     },
     nn::{
+        loss::{CrossEntropyLoss, CrossEntropyLossConfig},
         Dropout, DropoutConfig, Linear, LinearConfig, Relu,
     },
     optim::AdamConfig,
@@ -14,13 +15,10 @@ use burn::{
     record::{CompactRecorder, Recorder},
     tensor::backend::AutodiffBackend,
     train::{
-        metric::{CpuUse, LossMetric},
-        LearnerBuilder, TrainOutput, TrainStep, ValidStep,
+        metric::{AccuracyMetric, CpuUse, LossMetric},
+        ClassificationOutput, LearnerBuilder, TrainOutput, TrainStep, ValidStep,
     },
 };
-use burn::nn::loss::{CrossEntropyLoss, CrossEntropyLossConfig};
-use burn::train::metric::AccuracyMetric;
-use burn::train::ClassificationOutput;
 
 const CHARS: &str = " !#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~\n";
 const CHUNK_SIZE: usize = 64;
@@ -38,7 +36,7 @@ pub struct Model<B: Backend> {
 impl<B: Backend> Model<B> {
     pub fn forward(&self, x: Tensor<B, 3, Int>) -> Tensor<B, 2> {
         let batch_size = x.shape().dims[0];
-        let x = x.reshape([batch_size, CHUNK_SIZE*CHARS.len()]).float();
+        let x = x.reshape([batch_size, CHUNK_SIZE * CHARS.len()]).float();
         let x = self.linear1.forward(x);
         let x = self.dropout.forward(x);
         let x = self.activation.forward(x);
@@ -95,7 +93,7 @@ impl ModelConfig {
             linear4: LinearConfig::new(self.num_classes / 2, self.num_classes).init(&device),
             activation: Relu::new(),
             dropout: DropoutConfig::new(self.dropout).init(),
-            loss: CrossEntropyLossConfig::new().init(&device)
+            loss: CrossEntropyLossConfig::new().init(&device),
         }
     }
 }
@@ -111,11 +109,10 @@ impl<B: Backend> DataBatcher<B> {
     }
 }
 
-#[derive(Clone)]
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct DataBatch<B: Backend> {
     pub inputs: Tensor<B, 3, Int>,
-    pub targets: Tensor<B, 2, Int>
+    pub targets: Tensor<B, 2, Int>,
 }
 
 impl<B: Backend> Batcher<String, DataBatch<B>> for DataBatcher<B> {
@@ -134,8 +131,10 @@ impl<B: Backend> Batcher<String, DataBatch<B>> for DataBatcher<B> {
 
         let pre = Tensor::cat(vals, 0).to_device(&self.device);
         let targets = pre.to_owned().reshape([items.len(), CHUNK_SIZE]);
-        let inputs = pre.one_hot(CHARS.len()).reshape([items.len(), CHUNK_SIZE, CHARS.len()]);
-        DataBatch {targets, inputs}
+        let inputs = pre
+            .one_hot(CHARS.len())
+            .reshape([items.len(), CHUNK_SIZE, CHARS.len()]);
+        DataBatch { targets, inputs }
     }
 }
 
@@ -251,13 +250,18 @@ fn main() {
 
     let device = WgpuDevice::default();
     if args().nth(1).is_some_and(|a| a == "infer") {
-        let text = include_str!("../../bee.txt")
-            .split_at(8192)
-            .0
-            .as_bytes()
-            .chunks(CHUNK_SIZE)
-            .map(|a| String::from_utf8_lossy(a).to_string())
-            .collect::<Vec<_>>();
+        let text = if let Some(mut text) = args().nth(2) {
+            while text.len() % CHUNK_SIZE != 0 {
+                text.push(' ');
+            }
+            text
+        } else {
+            include_str!("../../bee.txt").split_at(8192).0.into()
+        }
+        .as_bytes()
+        .chunks(CHUNK_SIZE)
+        .map(|a| String::from_utf8_lossy(a).to_string())
+        .collect::<Vec<_>>();
         infer::<MyBackend>("/tmp/autoencoder", device, text)
     } else {
         train::<MyAutodiffBackend>(
