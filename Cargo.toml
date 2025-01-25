@@ -2,6 +2,9 @@
 members = ["autoencoder"]
 resolver = "2"
 
+[profile.dev]
+opt-level = 3
+
 [workspace.lints.rust]
 future-incompatible = "deny"
 

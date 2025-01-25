@@ -7,7 +7,6 @@ use burn::{
         dataset::Dataset,
     },
     nn::{
-        loss::{MseLoss, Reduction},
         Dropout, DropoutConfig, Linear, LinearConfig, Relu,
     },
     optim::AdamConfig,
@@ -16,9 +15,12 @@ use burn::{
     tensor::backend::AutodiffBackend,
     train::{
         metric::{CpuUse, LossMetric},
-        LearnerBuilder, RegressionOutput, TrainOutput, TrainStep, ValidStep,
+        LearnerBuilder, TrainOutput, TrainStep, ValidStep,
     },
 };
+use burn::nn::loss::{CrossEntropyLoss, CrossEntropyLossConfig};
+use burn::train::metric::AccuracyMetric;
+use burn::train::ClassificationOutput;
 
 const CHARS: &str = " !#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~\n";
 const CHUNK_SIZE: usize = 64;
@@ -30,10 +32,13 @@ pub struct Model<B: Backend> {
     linear4: Linear<B>,
     activation: Relu,
     dropout: Dropout,
+    loss: CrossEntropyLoss<B>,
 }
 
 impl<B: Backend> Model<B> {
-    pub fn forward(&self, x: Tensor<B, 2>) -> Tensor<B, 2> {
+    pub fn forward(&self, x: Tensor<B, 3, Int>) -> Tensor<B, 2> {
+        let batch_size = x.shape().dims[0];
+        let x = x.reshape([batch_size, CHUNK_SIZE*CHARS.len()]).float();
         let x = self.linear1.forward(x);
         let x = self.dropout.forward(x);
         let x = self.activation.forward(x);
@@ -50,24 +55,25 @@ impl<B: Backend> Model<B> {
         #[allow(clippy::let_and_return)]
         x
     }
-    pub fn forward_regression(&self, x: Tensor<B, 2>) -> RegressionOutput<B> {
-        let output = self.forward(x.clone());
-        let loss = MseLoss::new().forward(output.clone(), x.clone(), Reduction::Auto);
+    pub fn forward_regression(&self, x: DataBatch<B>) -> ClassificationOutput<B> {
+        let output = self.forward(x.inputs).reshape([-1, CHARS.len() as i32]);
+        let targets = x.targets.reshape([-1]);
+        let loss = self.loss.forward(output.to_owned(), targets.to_owned());
 
-        RegressionOutput::new(loss, output, x)
+        ClassificationOutput::new(loss, output, targets)
     }
 }
 
-impl<B: AutodiffBackend> TrainStep<Tensor<B, 2>, RegressionOutput<B>> for Model<B> {
-    fn step(&self, batch: Tensor<B, 2>) -> TrainOutput<RegressionOutput<B>> {
+impl<B: AutodiffBackend> TrainStep<DataBatch<B>, ClassificationOutput<B>> for Model<B> {
+    fn step(&self, batch: DataBatch<B>) -> TrainOutput<ClassificationOutput<B>> {
         let item = self.forward_regression(batch);
 
         TrainOutput::new(self, item.loss.backward(), item)
     }
 }
 
-impl<B: Backend> ValidStep<Tensor<B, 2>, RegressionOutput<B>> for Model<B> {
-    fn step(&self, batch: Tensor<B, 2>) -> RegressionOutput<B> {
+impl<B: Backend> ValidStep<DataBatch<B>, ClassificationOutput<B>> for Model<B> {
+    fn step(&self, batch: DataBatch<B>) -> ClassificationOutput<B> {
         self.forward_regression(batch)
     }
 }
@@ -89,6 +95,7 @@ impl ModelConfig {
             linear4: LinearConfig::new(self.num_classes / 2, self.num_classes).init(&device),
             activation: Relu::new(),
             dropout: DropoutConfig::new(self.dropout).init(),
+            loss: CrossEntropyLossConfig::new().init(&device)
         }
     }
 }
@@ -104,21 +111,31 @@ impl<B: Backend> DataBatcher<B> {
     }
 }
 
-impl<B: Backend> Batcher<String, Tensor<B, 2>> for DataBatcher<B> {
-    fn batch(&self, items: Vec<String>) -> Tensor<B, 2> {
+#[derive(Clone)]
+#[derive(Debug)]
+pub struct DataBatch<B: Backend> {
+    pub inputs: Tensor<B, 3, Int>,
+    pub targets: Tensor<B, 2, Int>
+}
+
+impl<B: Backend> Batcher<String, DataBatch<B>> for DataBatcher<B> {
+    fn batch(&self, items: Vec<String>) -> DataBatch<B> {
         let vals = items
             .iter()
             .map(|a| {
                 let tensors = a
                     .chars()
                     .map(|a| CHARS.find(a).unwrap_or_default())
-                    .map(|c| Tensor::<B, 1>::one_hot(c, CHARS.len(), &self.device))
+                    // .map(|c| Tensor::<B, 1>::one_hot(c, CHARS.len(), &self.device))
                     .collect::<Vec<_>>();
-                Tensor::cat(tensors, 0).reshape([1, CHARS.len() * CHUNK_SIZE])
+                Tensor::<B, 1, Int>::from_ints(&*tensors, &self.device)
             })
             .collect();
 
-        Tensor::cat(vals, 0).to_device(&self.device)
+        let pre = Tensor::cat(vals, 0).to_device(&self.device);
+        let targets = pre.to_owned().reshape([items.len(), CHUNK_SIZE]);
+        let inputs = pre.one_hot(CHARS.len()).reshape([items.len(), CHUNK_SIZE, CHARS.len()]);
+        DataBatch {targets, inputs}
     }
 }
 
@@ -180,6 +197,8 @@ pub fn train<B: AutodiffBackend>(artifact_dir: &str, config: TrainingConfig, dev
     let mut lb = LearnerBuilder::new(artifact_dir)
         .metric_train_numeric(LossMetric::new())
         .metric_valid_numeric(LossMetric::new())
+        .metric_train_numeric(AccuracyMetric::new())
+        .metric_valid_numeric(AccuracyMetric::new())
         .metric_train_numeric(CpuUse::new())
         .metric_valid_numeric(CpuUse::new())
         .with_file_checkpointer(CompactRecorder::new())
@@ -213,7 +232,7 @@ pub fn infer<B: Backend>(artifact_dir: &str, device: B::Device, items: Vec<Strin
     let batcher = DataBatcher::new(device);
     let batch = batcher.batch(items.clone());
     let output = model
-        .forward(batch.clone())
+        .forward(batch.inputs)
         .reshape([items.len(), CHUNK_SIZE, CHARS.len()])
         .argmax(2)
         .into_data();
